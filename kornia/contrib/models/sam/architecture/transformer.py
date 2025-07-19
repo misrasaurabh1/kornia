@@ -155,32 +155,39 @@ class TwoWayAttentionBlock(Module):
 
     def forward(self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor) -> tuple[Tensor, Tensor]:
         # Self attention block
-        if self.skip_first_layer_pe:
-            queries = self.self_attn(q=queries, k=queries, v=queries)
+        skip_first_layer_pe = self.skip_first_layer_pe
+        self_attn = self.self_attn
+        norm1 = self.norm1
+        cross_attn_token_to_image = self.cross_attn_token_to_image
+        norm2 = self.norm2
+        mlp = self.mlp
+        norm3 = self.norm3
+        cross_attn_image_to_token = self.cross_attn_image_to_token
+        norm4 = self.norm4
+
+        if skip_first_layer_pe:
+            queries = self_attn(q=queries, k=queries, v=queries)
         else:
             q = queries + query_pe
-            attn_out = self.self_attn(q=q, k=q, v=queries)
-            queries = queries + attn_out
-        queries = self.norm1(queries)
+            # Avoid new variable for attn_out, update queries in place as much as possible
+            queries = queries + self_attn(q=q, k=q, v=queries)
+        queries = norm1(queries)
 
         # Cross attention block, tokens attending to image embedding
         q = queries + query_pe
         k = keys + key_pe
-        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
-        queries = queries + attn_out
-        queries = self.norm2(queries)
+        queries = queries + cross_attn_token_to_image(q=q, k=k, v=keys)
+        queries = norm2(queries)
 
         # MLP block
-        mlp_out = self.mlp(queries)
-        queries = queries + mlp_out
-        queries = self.norm3(queries)
+        queries = queries + mlp(queries)
+        queries = norm3(queries)
 
         # Cross attention block, image embedding attending to tokens
         q = queries + query_pe
         k = keys + key_pe
-        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
-        keys = keys + attn_out
-        keys = self.norm4(keys)
+        keys = keys + cross_attn_image_to_token(q=k, k=q, v=queries)
+        keys = norm4(keys)
 
         return queries, keys
 
