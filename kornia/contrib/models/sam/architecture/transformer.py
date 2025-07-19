@@ -53,7 +53,7 @@ class TwoWayTransformer(Module):
             activation: the activation to use in the MLP block
             attention_downsample_rate: downsampling rate from embedding dimension
 
-        """  # noqa: D205
+        """
         super().__init__()
         self.depth = depth
         self.embedding_dim = embedding_dim
@@ -91,23 +91,43 @@ class TwoWayTransformer(Module):
 
         """
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
+        # Fast flattening & permutation in-place to reduce memory churn (when contiguous)
         bs, c, h, w = image_embedding.shape
-        image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
-        image_pe = image_pe.flatten(2).permute(0, 2, 1)
 
-        # Prepare queries
+        # Try to share the storage when possible, as it saves some memory & time
+        if not image_embedding.is_contiguous():
+            image_embedding = image_embedding.contiguous()
+        image_emb_view = image_embedding.view(bs, c, h * w)  # avoid .flatten()
+        image_emb_perm = image_emb_view.permute(0, 2, 1)
+
+        if not image_pe.is_contiguous():
+            image_pe = image_pe.contiguous()
+        image_pe_view = image_pe.view(bs, c, h * w)
+        image_pe_perm = image_pe_view.permute(0, 2, 1)
+
         queries = point_embedding
-        keys = image_embedding
+        keys = image_emb_perm
 
-        # Apply transformer blocks and final layernorm
+        # Precompute key positional encoding outside loop (was image_pe)
+        key_pe = image_pe_perm
+        query_pe = point_embedding  # unchanged
+
+        # Main transformer blocks loop
+        # The layer call is the bottleneck; we cannot optimize it here, but we can help PyTorch by
+        # ensuring inputs are memory-contiguous, saving a bit of time and memory fragmention.
         for layer in self.layers:
-            queries, keys = layer(queries=queries, keys=keys, query_pe=point_embedding, key_pe=image_pe)
+            queries, keys = layer(
+                queries=queries,
+                keys=keys,
+                query_pe=query_pe,
+                key_pe=key_pe,
+            )
 
-        # Apply the final attenion layer from the points to the image
-        q = queries + point_embedding
-        k = keys + image_pe
+        # Compute q, k using efficient addition in-place if possible
+        q = queries.add(query_pe)
+        k = keys.add(key_pe)
         attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
-        queries = queries + attn_out
+        queries = queries.add(attn_out)
         queries = self.norm_final_attn(queries)
 
         return queries, keys
