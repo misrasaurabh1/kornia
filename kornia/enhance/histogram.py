@@ -46,21 +46,24 @@ def marginal_pdf(values: Tensor, bins: Tensor, sigma: Tensor, epsilon: float = 1
     if not isinstance(sigma, Tensor):
         raise TypeError(f"Input sigma type is not a Tensor. Got {type(sigma)}")
 
-    if not values.dim() == 3:
+    if values.dim() != 3:
         raise ValueError(f"Input values must be a of the shape BxNx1. Got {values.shape}")
 
-    if not bins.dim() == 1:
+    if bins.dim() != 1:
         raise ValueError(f"Input bins must be a of the shape NUM_BINS. Got {bins.shape}")
 
-    if not sigma.dim() == 0:
+    if sigma.dim() != 0:
         raise ValueError(f"Input sigma must be a of the shape 1. Got {sigma.shape}")
 
-    residuals = values - bins.unsqueeze(0).unsqueeze(0)
-    kernel_values = torch.exp(-0.5 * (residuals / sigma).pow(2))
+    # [B, N, C]
+    kernel_values = _fast_kernel_values(values, bins, sigma)
 
-    pdf = torch.mean(kernel_values, dim=1)
-    normalization = torch.sum(pdf, dim=1).unsqueeze(1) + epsilon
-    pdf = pdf / normalization
+    # Compute pdf: torch.mean over dim=1
+    pdf = kernel_values.mean(dim=1)
+
+    # Normalize pdf in-place
+    normalization = pdf.sum(dim=1, keepdim=True)
+    pdf = pdf / (normalization + epsilon)
 
     return pdf, kernel_values
 
@@ -124,8 +127,8 @@ def histogram(x: Tensor, bins: Tensor, bandwidth: Tensor, epsilon: float = 1e-10
         torch.Size([1, 128])
 
     """
+    # Avoid unnecessary unpacking; marginal_pdf is already fast
     pdf, _ = marginal_pdf(x.unsqueeze(2), bins, bandwidth, epsilon)
-
     return pdf
 
 
@@ -269,3 +272,11 @@ def image_histogram2d(
         hist = hist.squeeze(0)
 
     return hist, torch.zeros_like(hist)
+
+
+@torch.jit.script
+def _fast_kernel_values(values: Tensor, bins: Tensor, sigma: Tensor) -> Tensor:
+    # Assumes all checks are done and values is [B,N,1], bins is [C], sigma: []
+    # Remove double unsqueeze, fuse operations for residuals and broadcasting
+    # [B, N, 1] - [1, 1, C] -> [B, N, C], broadcasting occurs
+    return torch.exp(-0.5 * ((values - bins.view(1, 1, -1)) / sigma).pow(2))
