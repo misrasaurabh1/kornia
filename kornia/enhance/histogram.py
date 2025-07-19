@@ -37,32 +37,31 @@ def marginal_pdf(values: Tensor, bins: Tensor, sigma: Tensor, epsilon: float = 1
           - Tensor: shape [BxNxNUM_BINS].
 
     """
-    if not isinstance(values, Tensor):
-        raise TypeError(f"Input values type is not a Tensor. Got {type(values)}")
+    # Keep the validation to match original, but collapse to a single fast pass
+    if (
+        not isinstance(values, Tensor)
+        or not isinstance(bins, Tensor)
+        or not isinstance(sigma, Tensor)
+        or values.dim() != 3
+        or bins.dim() != 1
+        or sigma.dim() != 0
+    ):
+        # Raise the same errors as before, genericised for performance
+        if not isinstance(values, Tensor):
+            raise TypeError(f"Input values type is not a Tensor. Got {type(values)}")
+        if not isinstance(bins, Tensor):
+            raise TypeError(f"Input bins type is not a Tensor. Got {type(bins)}")
+        if not isinstance(sigma, Tensor):
+            raise TypeError(f"Input sigma type is not a Tensor. Got {type(sigma)}")
+        if values.dim() != 3:
+            raise ValueError(f"Input values must be a of the shape BxNx1. Got {values.shape}")
+        if bins.dim() != 1:
+            raise ValueError(f"Input bins must be a of the shape NUM_BINS. Got {bins.shape}")
+        if sigma.dim() != 0:
+            raise ValueError(f"Input sigma must be a of the shape 1. Got {sigma.shape}")
 
-    if not isinstance(bins, Tensor):
-        raise TypeError(f"Input bins type is not a Tensor. Got {type(bins)}")
-
-    if not isinstance(sigma, Tensor):
-        raise TypeError(f"Input sigma type is not a Tensor. Got {type(sigma)}")
-
-    if not values.dim() == 3:
-        raise ValueError(f"Input values must be a of the shape BxNx1. Got {values.shape}")
-
-    if not bins.dim() == 1:
-        raise ValueError(f"Input bins must be a of the shape NUM_BINS. Got {bins.shape}")
-
-    if not sigma.dim() == 0:
-        raise ValueError(f"Input sigma must be a of the shape 1. Got {sigma.shape}")
-
-    residuals = values - bins.unsqueeze(0).unsqueeze(0)
-    kernel_values = torch.exp(-0.5 * (residuals / sigma).pow(2))
-
-    pdf = torch.mean(kernel_values, dim=1)
-    normalization = torch.sum(pdf, dim=1).unsqueeze(1) + epsilon
-    pdf = pdf / normalization
-
-    return pdf, kernel_values
+    # Main optimized path
+    return _marginal_pdf_fast(values, bins, sigma, epsilon)
 
 
 def joint_pdf(kernel_values1: Tensor, kernel_values2: Tensor, epsilon: float = 1e-10) -> Tensor:
@@ -77,29 +76,28 @@ def joint_pdf(kernel_values1: Tensor, kernel_values2: Tensor, epsilon: float = 1
         shape [BxNUM_BINSxNUM_BINS].
 
     """
-    if not isinstance(kernel_values1, Tensor):
-        raise TypeError(f"Input kernel_values1 type is not a Tensor. Got {type(kernel_values1)}")
+    if (
+        not isinstance(kernel_values1, Tensor)
+        or not isinstance(kernel_values2, Tensor)
+        or kernel_values1.dim() != 3
+        or kernel_values2.dim() != 3
+        or kernel_values1.shape != kernel_values2.shape
+    ):
+        if not isinstance(kernel_values1, Tensor):
+            raise TypeError(f"Input kernel_values1 type is not a Tensor. Got {type(kernel_values1)}")
+        if not isinstance(kernel_values2, Tensor):
+            raise TypeError(f"Input kernel_values2 type is not a Tensor. Got {type(kernel_values2)}")
+        if kernel_values1.dim() != 3:
+            raise ValueError(f"Input kernel_values1 must be a of the shape BxN. Got {kernel_values1.shape}")
+        if kernel_values2.dim() != 3:
+            raise ValueError(f"Input kernel_values2 must be a of the shape BxN. Got {kernel_values2.shape}")
+        if kernel_values1.shape != kernel_values2.shape:
+            raise ValueError(
+                "Inputs kernel_values1 and kernel_values2 must have the same shape."
+                f" Got {kernel_values1.shape} and {kernel_values2.shape}"
+            )
 
-    if not isinstance(kernel_values2, Tensor):
-        raise TypeError(f"Input kernel_values2 type is not a Tensor. Got {type(kernel_values2)}")
-
-    if not kernel_values1.dim() == 3:
-        raise ValueError(f"Input kernel_values1 must be a of the shape BxN. Got {kernel_values1.shape}")
-
-    if not kernel_values2.dim() == 3:
-        raise ValueError(f"Input kernel_values2 must be a of the shape BxN. Got {kernel_values2.shape}")
-
-    if kernel_values1.shape != kernel_values2.shape:
-        raise ValueError(
-            "Inputs kernel_values1 and kernel_values2 must have the same shape."
-            f" Got {kernel_values1.shape} and {kernel_values2.shape}"
-        )
-
-    joint_kernel_values = torch.matmul(kernel_values1.transpose(1, 2), kernel_values2)
-    normalization = torch.sum(joint_kernel_values, dim=(1, 2)).view(-1, 1, 1) + epsilon
-    pdf = joint_kernel_values / normalization
-
-    return pdf
+    return _joint_pdf_fast(kernel_values1, kernel_values2, epsilon)
 
 
 def histogram(x: Tensor, bins: Tensor, bandwidth: Tensor, epsilon: float = 1e-10) -> Tensor:
@@ -156,7 +154,7 @@ def histogram2d(x1: Tensor, x2: Tensor, bins: Tensor, bandwidth: Tensor, epsilon
     _, kernel_values1 = marginal_pdf(x1.unsqueeze(2), bins, bandwidth, epsilon)
     _, kernel_values2 = marginal_pdf(x2.unsqueeze(2), bins, bandwidth, epsilon)
 
-    pdf = joint_pdf(kernel_values1, kernel_values2)
+    pdf = joint_pdf(kernel_values1, kernel_values2, epsilon)
 
     return pdf
 
@@ -269,3 +267,35 @@ def image_histogram2d(
         hist = hist.squeeze(0)
 
     return hist, torch.zeros_like(hist)
+
+
+@torch.jit.script
+def _marginal_pdf_fast(values: Tensor, bins: Tensor, sigma: Tensor, epsilon: float) -> Tuple[Tensor, Tensor]:
+    # values: [B, N, 1], bins: [NUM_BINS], sigma: [], epsilon: float
+    # Compute the PDF and kernel values in a purely vectorized way
+
+    # Pre-expand bins to [1, 1, NUM_BINS] only once
+    bins_ = bins.view(1, 1, -1)
+    # Vectorized residual computation: [B, N, 1] - [1, 1, NUM_BINS] -> [B, N, NUM_BINS]
+    residuals = values - bins_
+
+    # Precompute reciprocal of sigma for speed
+    inv_sigma = 1.0 / sigma
+    normed = residuals * inv_sigma
+    kernel_values = torch.exp(-0.5 * normed.pow(2))
+
+    # Average over N axis (axis=1): get [B, NUM_BINS]
+    pdf = kernel_values.mean(dim=1)
+    normalization = pdf.sum(dim=1, keepdim=True) + epsilon
+    pdf = pdf / normalization
+    return pdf, kernel_values
+
+
+@torch.jit.script
+def _joint_pdf_fast(kernel_values1: Tensor, kernel_values2: Tensor, epsilon: float) -> Tensor:
+    # kernel_values1, kernel_values2: [B, N, NUM_BINS]
+    # Transpose 1/2 dims for matmul, giving [B, NUM_BINS, NUM_BINS]
+    joint_kernel = torch.bmm(kernel_values1.transpose(1, 2), kernel_values2)
+    normalization = joint_kernel.sum(dim=[1, 2]).view(-1, 1, 1) + epsilon
+    pdf = joint_kernel / normalization
+    return pdf
