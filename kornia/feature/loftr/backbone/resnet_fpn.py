@@ -37,25 +37,29 @@ class BasicBlock(Module):
     def __init__(self, in_planes: int, planes: int, stride: int = 1) -> None:
         super().__init__()
         self.conv1 = conv3x3(in_planes, planes, stride)
-        self.conv2 = conv3x3(planes, planes)
         self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = conv3x3(planes, planes)
         self.bn2 = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU(inplace=True)
 
-        if stride == 1:
-            self.downsample = None
-        else:
+        self.downsample = None
+        if stride != 1:
             self.downsample = nn.Sequential(conv1x1(in_planes, planes, stride=stride), nn.BatchNorm2d(planes))
 
     def forward(self, x: Tensor) -> Tensor:
-        y = x
-        y = self.relu(self.bn1(self.conv1(y)))
-        y = self.bn2(self.conv2(y))
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
 
         if self.downsample is not None:
-            x = self.downsample(x)
+            identity = self.downsample(x)
 
-        return self.relu(x + y)
+        out += identity
+        return self.relu(out)
 
 
 class ResNetFPN_8_2(nn.Module):
