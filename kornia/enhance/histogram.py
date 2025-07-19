@@ -77,29 +77,22 @@ def joint_pdf(kernel_values1: Tensor, kernel_values2: Tensor, epsilon: float = 1
         shape [BxNUM_BINSxNUM_BINS].
 
     """
+    # Type/shape checks, unoptimized, as errors should be caught quickly if present.
     if not isinstance(kernel_values1, Tensor):
         raise TypeError(f"Input kernel_values1 type is not a Tensor. Got {type(kernel_values1)}")
-
     if not isinstance(kernel_values2, Tensor):
         raise TypeError(f"Input kernel_values2 type is not a Tensor. Got {type(kernel_values2)}")
-
-    if not kernel_values1.dim() == 3:
+    if kernel_values1.dim() != 3:
         raise ValueError(f"Input kernel_values1 must be a of the shape BxN. Got {kernel_values1.shape}")
-
-    if not kernel_values2.dim() == 3:
+    if kernel_values2.dim() != 3:
         raise ValueError(f"Input kernel_values2 must be a of the shape BxN. Got {kernel_values2.shape}")
-
     if kernel_values1.shape != kernel_values2.shape:
         raise ValueError(
             "Inputs kernel_values1 and kernel_values2 must have the same shape."
             f" Got {kernel_values1.shape} and {kernel_values2.shape}"
         )
-
-    joint_kernel_values = torch.matmul(kernel_values1.transpose(1, 2), kernel_values2)
-    normalization = torch.sum(joint_kernel_values, dim=(1, 2)).view(-1, 1, 1) + epsilon
-    pdf = joint_kernel_values / normalization
-
-    return pdf
+    # Use batched matrix multiplication for efficiency.
+    return _fast_joint_pdf(kernel_values1, kernel_values2, epsilon)
 
 
 def histogram(x: Tensor, bins: Tensor, bandwidth: Tensor, epsilon: float = 1e-10) -> Tensor:
@@ -269,3 +262,12 @@ def image_histogram2d(
         hist = hist.squeeze(0)
 
     return hist, torch.zeros_like(hist)
+
+
+@torch.jit.script  # TorchScript compilation for improved runtime performance.
+def _fast_joint_pdf(kernel_values1: Tensor, kernel_values2: Tensor, epsilon: float = 1e-10) -> Tensor:
+    # Assumes shape/consistency checks done prior to calling.
+    joint_kernel_values = torch.bmm(kernel_values1.transpose(1, 2), kernel_values2)
+    normalization = joint_kernel_values.sum(dim=(1, 2), keepdim=True) + epsilon
+    pdf = joint_kernel_values / normalization
+    return pdf
